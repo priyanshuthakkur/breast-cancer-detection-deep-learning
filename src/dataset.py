@@ -4,15 +4,36 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-# Resize to 224x224 and normalize with ImageNet statistics — required because
-# the model starts from ImageNet-pretrained weights (see src/model.py).
-TRANSFORM = transforms.Compose([
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# Validation/inference: deterministic resize + normalize only — no
+# augmentation, so evaluation numbers are stable and reproducible.
+VAL_TRANSFORM = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    ),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+# Kept as an alias so existing imports (predict.py, older scripts) keep working.
+TRANSFORM = VAL_TRANSFORM
+
+# Training: light, label-preserving augmentation. The original dissertation
+# run used no augmentation at all, which is the single biggest driver of the
+# overfitting it reports (97.9% train acc vs 65% val acc by epoch 10) — the
+# model had nothing to do but memorize ~4.5k fixed crops. Flips and small
+# rotations/translations are safe for mammogram crops (a lesion is still the
+# same lesion mirrored or nudged a few pixels); we avoid anything that could
+# change apparent tissue density (e.g. no aggressive color/contrast jitter),
+# since density is diagnostically meaningful.
+TRAIN_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.5),
+    transforms.RandomAffine(degrees=15, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
 ])
 
 
@@ -28,7 +49,9 @@ class BreastCancerDataset(Dataset):
 
     def __init__(self, df, transform=None):
         self.df = df.reset_index(drop=True)
-        self.transform = transform or TRANSFORM
+        # Defaults to the non-augmented transform if the caller doesn't pass
+        # one — always pass TRAIN_TRANSFORM explicitly for a training split.
+        self.transform = transform or VAL_TRANSFORM
 
     def __len__(self):
         return len(self.df)

@@ -1,4 +1,8 @@
-"""Training loop with per-epoch metrics and best-checkpoint saving."""
+"""Training loop with per-epoch metrics, early stopping, mixed precision, and
+best-checkpoint saving.
+"""
+
+from typing import Optional
 
 import torch
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
@@ -12,6 +16,33 @@ def calc_metrics(y_true, y_pred):
     return acc, prec, rec, f1
 
 
+class EarlyStopping:
+    """Stops training once validation F1 hasn't improved for `patience` epochs.
+
+    The original dissertation run trained a fixed 10 epochs regardless of
+    what validation loss/F1 was doing — by its own account, validation loss
+    was still rising at the end while training loss kept falling (textbook
+    overfitting). Stopping at the actual best epoch instead of a fixed count
+    is free accuracy and free compute.
+    """
+
+    def __init__(self, patience: int = 3, min_delta: float = 0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_score = 0.0
+        self.epochs_without_improvement = 0
+
+    def step(self, val_f1: float) -> bool:
+        """Call once per epoch with the epoch's validation F1. Returns True
+        when training should stop."""
+        if val_f1 > self.best_score + self.min_delta:
+            self.best_score = val_f1
+            self.epochs_without_improvement = 0
+        else:
+            self.epochs_without_improvement += 1
+        return self.epochs_without_improvement >= self.patience
+
+
 def train_model(
     model,
     train_loader,
@@ -20,18 +51,31 @@ def train_model(
     optimizer,
     scheduler,
     epochs: int = 10,
-    device: str = "cpu",
+    device="cpu",
     checkpoint_path: str = "models/best_model.pth",
+    patience: int = 3,
+    use_amp: bool = True,
+    grad_clip_norm: Optional[float] = 1.0,
 ):
-    """Trains for `epochs`, tracking loss/accuracy/precision/recall/F1 on both
-    splits. The checkpoint with the best validation F1 (not accuracy — see
-    README for why) is written to `checkpoint_path`.
+    """Trains for up to `epochs`, tracking loss/accuracy/precision/recall/F1
+    on both splits, and stopping early once validation F1 plateaus.
+
+    use_amp: mixed-precision training via torch.cuda.amp — roughly 1.5-2x
+        faster on a Colab/consumer GPU with lower memory use, at effectively
+        no accuracy cost. Automatically a no-op on CPU.
+    grad_clip_norm: clips gradient norm to stabilize training, particularly
+        useful once the backbone is unfrozen and gradients flow through the
+        whole network. Set to None to disable.
     """
     history = {k: [] for k in (
         "train_loss", "val_loss", "train_acc", "val_acc",
         "train_prec", "val_prec", "train_rec", "val_rec",
         "train_f1", "val_f1",
     )}
+
+    amp_enabled = use_amp and torch.device(device).type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    early_stopping = EarlyStopping(patience=patience)
 
     best_val_f1 = 0.0
 
@@ -42,16 +86,25 @@ def train_model(
         for images, labels in train_loader:
             images, labels = images.to(device), labels.to(device)
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+
+            if grad_clip_norm is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item() * images.size(0)
             preds = torch.argmax(outputs, 1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(preds.detach().cpu().numpy())
+            all_labels.extend(labels.detach().cpu().numpy())
 
         train_loss /= len(train_loader.dataset)
         train_acc, train_prec, train_rec, train_f1 = calc_metrics(all_labels, all_preds)
@@ -62,8 +115,9 @@ def train_model(
         with torch.no_grad():
             for images, labels in val_loader:
                 images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
 
                 val_loss += loss.item() * images.size(0)
                 preds = torch.argmax(outputs, 1)
@@ -99,5 +153,12 @@ def train_model(
             f"Train Acc: {train_acc:.4f} Val Acc: {val_acc:.4f} "
             f"Val F1: {val_f1:.4f}"
         )
+
+        if early_stopping.step(val_f1):
+            print(
+                f"Early stopping: val F1 hasn't improved in {patience} epochs "
+                f"(best: {early_stopping.best_score:.4f}). Stopping at epoch {epoch + 1}/{epochs}."
+            )
+            break
 
     return model, history

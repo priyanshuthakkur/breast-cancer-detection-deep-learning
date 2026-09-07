@@ -48,16 +48,22 @@ cases with radiologist-confirmed pathology labels, ~6GB of JPEG images.
 
 ## Model & training
 
+The numbers below describe the original dissertation run exactly as it was
+trained. The current code in this repo defaults to a slightly different
+(regularized, faster) configuration — see *Improvements over the original
+dissertation run* further down for what changed and why.
+
 - **Architecture**: ResNet-50, ImageNet-pretrained, fine-tuned end-to-end
   with a new 2-class output head. (`src/model.py` also wires up
   EfficientNetV2 and ViT via `timm` as drop-in alternatives — noted as
   future work in the dissertation but not benchmarked here.)
-- **Input**: resized to 224×224, ImageNet normalization
+- **Input**: resized to 224×224, ImageNet normalization (no augmentation in
+  the original run — see *Improvements* below)
 - **Loss**: Cross-Entropy (a `FocalLoss` implementation is also included in
   `src/losses.py` as a ready-to-use option for class-imbalance mitigation)
 - **Optimizer**: Adam, lr=1e-4, weight decay=1e-5, with `ReduceLROnPlateau`
-- **10 epochs**, trained on a Colab GPU (~35 min); best checkpoint selected
-  on **validation F1**, not accuracy (see below for why)
+- **10 fixed epochs**, trained on a Colab GPU (~35 min); best checkpoint
+  selected on **validation F1**, not accuracy (see below for why)
 
 ![Training and validation curves](assets/loss_accuracy_curves.png)
 
@@ -85,6 +91,41 @@ al., 2022; Ahmad et al., 2023). This run uses a single-institution Kaggle
 subset with no attention/hybrid architecture and no additional dataset
 augmentation, so a meaningfully lower score is expected — see
 [Limitations](#limitations--honest-take).
+
+## Improvements over the original dissertation run
+
+The results table above is from the original dissertation run, unchanged —
+that's the honest baseline. Since then the training code (`src/`) has been
+extended to directly target the failure modes that run documented, without
+touching what actually happened during the dissertation itself:
+
+| Change | Targets | Where |
+|---|---|---|
+| Data augmentation (flips, small rotation/translation, mild color jitter) on the training split only | Overfitting — the original run had zero augmentation, so the model had nothing to do but memorize ~4.5k fixed crops | `src/dataset.py` (`TRAIN_TRANSFORM`) |
+| Dropout (p=0.3) before the final linear layer | Overfitting | `src/model.py` |
+| Label smoothing (0.1) on Cross-Entropy | Overconfident predictions on a noisy medical dataset | `run_train.py` |
+| Early stopping on validation F1 (default patience=3) | The original run trained a fixed 10 epochs while validation loss was still rising — stopping at the actual best epoch instead | `src/train.py` (`EarlyStopping`) |
+| Optional backbone freezing (`--freeze-backbone`) | Training speed/memory (skips gradients for ~23M frozen params) and a stronger overfitting guard for a first run | `src/model.py` |
+| Mixed-precision training (`torch.cuda.amp`), gradient clipping | Training speed/memory on GPU, stability once the backbone is unfrozen | `src/train.py` |
+| `num_workers` + `pin_memory` + `persistent_workers` on both DataLoaders | Data-loading throughput — the original run used the DataLoader defaults (`num_workers=0`), which serializes image decoding with the GPU forward/backward pass | `run_train.py` |
+
+**This hasn't been re-benchmarked yet.** These changes weren't trained end-to-end
+in this environment (no GPU, no local copy of the ~5GB dataset here) — they're
+principled fixes for the specific problems the original run's own numbers show,
+not a claimed new accuracy figure. To validate and update the results table
+above:
+
+```bash
+python run_train.py --epochs 15   # augmentation, dropout, early stopping, AMP all on by default
+```
+
+Expect: a smaller train/validation accuracy gap than the original 97.9%/64.8%,
+and training that stops itself once val F1 plateaus rather than running the
+full epoch count. For a faster first check for compute-constrained environments:
+
+```bash
+python run_train.py --freeze-backbone --epochs 10   # trains only ~4k params instead of ~23.5M
+```
 
 ## Limitations & honest take
 
@@ -136,8 +177,9 @@ pip install -r requirements.txt
 kaggle datasets download -d awsaf49/cbis-ddsm-breast-cancer-image-dataset
 unzip -q cbis-ddsm-breast-cancer-image-dataset.zip -d data/raw
 
-# 5. Train
-python run_train.py --epochs 10
+# 5. Train (augmentation, dropout, early stopping, mixed precision all on by default —
+#    see README > Improvements over the original run)
+python run_train.py --epochs 15
 
 # 6. Try the demo (needs a trained checkpoint at models/best_model.pth)
 streamlit run app/streamlit_app.py
@@ -186,8 +228,10 @@ breast-cancer-detection-deep-learning/
 | Transfer learning (CNNs) | `src/model.py` — ImageNet-pretrained ResNet-50, fine-tuned end-to-end |
 | Custom PyTorch data pipeline | `src/dataset.py`, `src/data_prep.py` — dataset joins, corrupt-file handling, transforms |
 | Imbalanced-classification evaluation | `src/train.py`, `src/evaluate.py` — precision/recall/F1 over accuracy, confusion matrix |
+| Overfitting diagnosis & mitigation | augmentation, dropout, label smoothing, early stopping — see *Improvements* above, each mapped to the symptom it targets |
+| Training efficiency | mixed precision, gradient clipping, optional backbone freezing, tuned `DataLoader`s — `src/train.py`, `run_train.py` |
 | Model deployment | `app/streamlit_app.py` — an interactive demo around a trained checkpoint |
-| Testing | `tests/` — pytest, mock data, no dependency on the real (multi-GB) dataset |
+| Testing | `tests/` — pytest, mock data, no dependency on the real (multi-GB) dataset or a GPU |
 | Research communication | this README, and the dissertation itself — honest framing of results and limitations |
 
 ## Extending this
